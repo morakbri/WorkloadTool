@@ -19,7 +19,7 @@ Tampermonkey userscript that auto-extracts rack positions from the weekly ShareP
 1. Install [Tampermonkey](https://www.tampermonkey.net/) browser extension
 2. Click the link below — Tampermonkey will prompt you to install:
 
-👉 **[Install AZGrab](https://raw.githubusercontent.com/morakbri/WorloadTool/AZGrab/azgrab.user.js)**
+👉 **[Install AZGrab](https://raw.githubusercontent.com/morakbri/WorkloadTool/AZGrab/azgrab.user.js)**
 
 That's it — updates are automatic.
 
