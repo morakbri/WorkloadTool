@@ -1,11 +1,11 @@
 
 // ==UserScript==
-// @name         6az Position Grabber
+// @name         AZGrab
 // @namespace    https://amazon.sharepoint.com/
-// @version      2.9.0
-// @updateURL    https://github.com/morakbri/aws-webscript/raw/refs/heads/main/6az-position-grabber.user.js
-// @downloadURL  https://github.com/morakbri/aws-webscript/raw/refs/heads/main/6az-position-grabber.user.js
-// @description  Auto-extracts rack positions from the Excel file you're currently viewing for 6az — filters by AZ column, pastes values only, trusts sheet formatting. Groups by site with 2-row gaps. Midday (blue/green) rows included in optics only, excluded from cabling.
+// @version      4.1.1
+// @updateURL    https://github.com/morakbri/aws-webscript/raw/refs/heads/main/azgrab.user.js
+// @downloadURL  https://github.com/morakbri/aws-webscript/raw/refs/heads/main/azgrab.user.js
+// @description  Auto-extracts rack positions from SharePoint Excel files — supports 1/62AZ, 6AZ, 7/55AZ, 12AZ with AZ selector. Groups by site with 2-row gaps. Midday rows (above thick border separator) included in optics only, excluded from cabling. Per-row midday override.
 // @author       @morakbri @tngujona
 // @match        https://*.sharepoint.com/*
 // @match        https://amazon.sharepoint.com/*
@@ -21,622 +21,325 @@
 (function () {
     'use strict';
     if (window.top !== window.self) return;
-    if (document.getElementById('az6-fab')) return;
+    if (document.getElementById('azg-fab')) return;
 
-    const TARGET_AZ = '6AZ';
-    const VALID_RACK_PREFIXES = ['EC2', 'MV.BONSAI', 'BONSAI', 'EBS'];
+    const AZ_MAP = {
+        '1/62AZ': { label: '1/62AZ',  match: ['1AZ', '62AZ', 'IAD1', 'IAD62'] },
+        '6AZ':    { label: '6AZ',     match: ['6AZ', 'IAD6'] },
+        '7/55AZ': { label: '7/55AZ',  match: ['7AZ', '55AZ', 'IAD7', 'IAD55'] },
+        '12AZ':   { label: '12AZ',    match: ['12AZ', 'IAD12'] }
+    };
+    let selectedAZ = '6AZ';
+    const VALID_RACK_PREFIXES = ['EC2', 'MV.BONSAI', 'BONSAI', 'EBS', 'S3'];
     const ALERT_LOST_RES = ['lost reservation', 'lost res'];
     const ALERT_REJECTED = ['rejected', 'reject'];
     const SITE_GAP_ROWS = 2;
-    const DESTINATION_DEFAULTS = {
+    const DEST = {
         brickHandoffDate:'', dateWorkloadReceived:'',
-        copper:'Not Installed', copperSignature:'Tech Alias',
-        fiber:'Not Installed', fiberSignature:'Tech Alias',
-        mnSignature:'Tech Alias',
-        optics:'Check for Optics', brickPatching:'Tech Alias',
-        sitePOC:'', positionStatus:''
+        copper:'Not Installed', copperSig:'Tech Alias',
+        fiber:'Not Installed', fiberSig:'Tech Alias',
+        mnSig:'Tech Alias', optics:'Check for Optics',
+        brickPatching:'Tech Alias', sitePOC:'', posStatus:''
     };
+    const THICK_BORDERS = ['thick', 'medium', 'double'];
 
-    // =========================================================================
-    // MIDDAY FILL DETECTION — Prep team marks midday deliveries with blue or
-    // green fill.  Both are optics-only (excluded from cabling copy).
-    // =========================================================================
-
-    // --- Blue detection (theme + indexed + RGB) ---
-    const BLUE_THEME_INDICES = [4, 5, 8, 9];
-    const BLUE_INDEXED_PALETTE = [5,12,23,28,30,32,33,39,40,41,44,48,49,54,55,56,62];
-
-    function isBlueRGB(rgb) {
-        if (!rgb || typeof rgb !== 'string') return false;
-        const hex = rgb.replace(/^#/, '').replace(/^FF/i, '').padStart(6, '0');
-        if (hex.length < 6) return false;
-        const r = parseInt(hex.substring(0, 2), 16);
-        const g = parseInt(hex.substring(2, 4), 16);
-        const b = parseInt(hex.substring(4, 6), 16);
-        return b > 140 && b > r * 1.4 && b > g * 1.3 && (r < 180 || g < 180);
+    // === MIDDAY DETECTION HELPERS ===
+    function isThickBorder(edge) {
+        return edge ? THICK_BORDERS.includes((edge.style||'').toLowerCase()) : false;
     }
-
-    // --- Green detection (RGB) ---
-    const GREEN_DETECT = { gMin: 140, rMaxRatio: 1.0, bMaxRatio: 1.0 };
-
-    function isGreenRGB(rgb) {
-        if (!rgb || typeof rgb !== 'string') return false;
-        let hex = rgb.replace(/^#/, '');
-        if (hex.length === 8) hex = hex.substring(2); // strip alpha prefix (AARRGGBB)
-        if (hex.length !== 6) return false;
-        const r = parseInt(hex.substring(0, 2), 16);
-        const g = parseInt(hex.substring(2, 4), 16);
-        const b = parseInt(hex.substring(4, 6), 16);
-        return g >= GREEN_DETECT.gMin && g > r * GREEN_DETECT.rMaxRatio && g > b * GREEN_DETECT.bMaxRatio;
+    function isDarkFill(cell) {
+        if (!cell || !cell.s) return false;
+        const src = [];
+        if (cell.s.fill) { if (cell.s.fill.fgColor) src.push(cell.s.fill.fgColor); if (cell.s.fill.bgColor) src.push(cell.s.fill.bgColor); }
+        if (cell.s.fgColor) src.push(cell.s.fgColor);
+        if (cell.s.bgColor) src.push(cell.s.bgColor);
+        if (cell.s.patternFill && cell.s.patternFill.fgColor) src.push(cell.s.patternFill.fgColor);
+        for (const c of src) {
+            if (c.rgb) { let h=c.rgb.replace(/^#/,''); if(h.length===8)h=h.substring(2); if(h.length>=6){ const r=parseInt(h.substring(0,2),16),g=parseInt(h.substring(2,4),16),b=parseInt(h.substring(4,6),16); if(r<40&&g<40&&b<40)return true; } }
+            if (c.theme!==undefined && Number(c.theme)===1) return true;
+            if (c.indexed!==undefined && (Number(c.indexed)===0||Number(c.indexed)===8)) return true;
+        }
+        return false;
     }
-
-    // --- Unified cell color check — returns 'blue', 'green', or null ---
-    function getCellMiddayColor(cell) {
-        if (!cell || !cell.s) return null;
-        const s = cell.s;
-        const colorSources = [];
-        if (s.fill) {
-            if (s.fill.fgColor) colorSources.push(s.fill.fgColor);
-            if (s.fill.bgColor) colorSources.push(s.fill.bgColor);
-        }
-        if (s.patternFill) {
-            if (s.patternFill.fgColor) colorSources.push(s.patternFill.fgColor);
-            if (s.patternFill.bgColor) colorSources.push(s.patternFill.bgColor);
-        }
-        if (s.fgColor) colorSources.push(s.fgColor);
-        if (s.bgColor) colorSources.push(s.bgColor);
-
-        for (const c of colorSources) {
-            // Check blue first (RGB → theme → indexed)
-            if (c.rgb && isBlueRGB(c.rgb)) return 'blue';
-            if (c.theme !== undefined && c.theme !== null) {
-                const t = Number(c.theme);
-                if (BLUE_THEME_INDICES.includes(t)) return 'blue';
-            }
-            if (c.indexed !== undefined && c.indexed !== null) {
-                const idx = Number(c.indexed);
-                if (BLUE_INDEXED_PALETTE.includes(idx)) return 'blue';
-            }
-            // Check green (RGB only)
-            if (c.rgb && isGreenRGB(c.rgb)) return 'green';
-        }
-        return null;
+    function rowHasData(sheet, r, maxC) {
+        for (let c=0;c<=maxC;c++) { const cell=sheet[XLSX.utils.encode_cell({r,c})]; if(cell&&cell.v!==undefined&&cell.v!==null&&String(cell.v).trim()!=='') return true; }
+        return false;
     }
-
-    // --- Row-level detection — scans first 10 cols, returns 'blue'|'green'|null ---
-    function detectRowMidday(sheet, rowIndex, colCount) {
-        for (let c = 0; c < Math.min(colCount, 10); c++) {
-            const addr = XLSX.utils.encode_cell({ r: rowIndex, c: c });
-            const cell = sheet[addr];
-            const color = getCellMiddayColor(cell);
-            if (color) return color;
-        }
-        return null;
+    function hasDataAboveAndBelow(sheet, sep, range, maxC) {
+        let above=false, below=false;
+        for(let r=range.s.r+1;r<sep;r++){if(rowHasData(sheet,r,maxC)){above=true;break;}}
+        for(let r=sep+1;r<=range.e.r;r++){if(rowHasData(sheet,r,maxC)){below=true;break;}}
+        return above&&below;
+    }
+    function findMiddaySeparatorRow(sheet) {
+        const ref=sheet['!ref']; if(!ref) return -1;
+        const range=XLSX.utils.decode_range(ref), maxC=Math.min(range.e.c,14), start=range.s.r+1;
+        for(let r=start;r<=Math.min(start+15,range.e.r);r++){const c=sheet[XLSX.utils.encode_cell({r,c:0})];if(c&&c.s)console.log('[azg] Row',r,'style:',JSON.stringify(c.s).substring(0,300));}
+        const cands=[];
+        for(let r=start;r<=range.e.r;r++){for(let c=range.s.c;c<=maxC;c++){const cell=sheet[XLSX.utils.encode_cell({r,c})];if(cell&&cell.v!==undefined){const v=String(cell.v).trim().toUpperCase();if(v==='MD'||v==='MIDDAY'||v==='MID-DAY'||v==='MID DAY'){console.log('[azg] MD marker row',r,'col',c);cands.push({row:r-1,type:'MD-text',score:100});}}}}
+        for(let r=start;r<=range.e.r;r++){let bb=0,tb=0,df=0,empty=true;for(let c=range.s.c;c<=maxC;c++){const addr=XLSX.utils.encode_cell({r,c}),cell=sheet[addr];if(cell){if(cell.v!==undefined&&cell.v!==null&&String(cell.v).trim()!=='')empty=false;if(cell.s&&cell.s.border&&isThickBorder(cell.s.border.bottom))bb++;if(isDarkFill(cell))df++;}if(r+1<=range.e.r){const nx=sheet[XLSX.utils.encode_cell({r:r+1,c})];if(nx&&nx.s&&nx.s.border&&isThickBorder(nx.s.border.top))tb++;}}
+            if(bb>=3)cands.push({row:r,type:'bottom-border',score:bb+10});if(tb>=3)cands.push({row:r,type:'top-border-next',score:tb+10});if(df>=3)cands.push({row:r-1,type:'dark-fill',score:df+5});if(empty&&r>start&&r<range.e.r)cands.push({row:r-1,type:'empty-row',score:1});}
+        console.log('[azg] Candidates:',cands.length,cands.map(c=>'row '+c.row+' ('+c.type+')').join(', '));
+        const valid=cands.filter(c=>hasDataAboveAndBelow(sheet,c.row+1,range,maxC));
+        if(!valid.length){console.log('[azg] No midday separator.');return -1;}
+        valid.sort((a,b)=>b.score-a.score);
+        console.log('[azg] Best separator:',valid[0].type,'row',valid[0].row);
+        return valid[0].row;
     }
 
     // === STYLES ===
-    const styles = document.createElement('style');
-    styles.textContent = `
-#az6-fab{position:fixed;bottom:30px;right:30px;width:56px;height:56px;border-radius:50%;background:#2563eb;color:#fff;font-size:14px;font-weight:700;border:none;cursor:pointer;z-index:2147483647;box-shadow:0 4px 14px rgba(37,99,235,.4);display:flex;align-items:center;justify-content:center;transition:transform .2s,box-shadow .2s;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
-#az6-fab:hover{transform:scale(1.1);box-shadow:0 6px 20px rgba(37,99,235,.6)}
-#az6-fab.az6-loading{animation:az6-pulse 1.2s infinite;background:#1d4ed8}
-@keyframes az6-pulse{0%,100%{box-shadow:0 4px 14px rgba(37,99,235,.4)}50%{box-shadow:0 4px 24px rgba(37,99,235,.8)}}
-#az6-popup-overlay{position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,.6);z-index:2147483646;display:none;align-items:center;justify-content:center}
-#az6-popup-overlay.az6-visible{display:flex}
-#az6-popup{background:#111827;border:1px solid #374151;border-radius:12px;width:960px;max-width:94vw;max-height:88vh;overflow-y:auto;padding:24px;color:#e5e7eb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;box-shadow:0 25px 60px rgba(0,0,0,.5)}
-#az6-popup h2{margin:0 0 4px;font-size:20px;color:#fff}
-#az6-popup .az6-subtitle{color:#9ca3af;font-size:12px;margin-bottom:16px}
-#az6-file-info{background:#1f2937;border:1px solid #374151;border-radius:6px;padding:10px 14px;margin-bottom:16px;display:flex;align-items:center;gap:10px}
-#az6-file-info .az6-file-icon{font-size:20px}
-#az6-file-info .az6-file-details{flex:1}
-#az6-file-info .az6-file-name{color:#34d399;font-weight:600;font-size:13px}
-#az6-file-info .az6-file-source{color:#6b7280;font-size:11px;margin-top:2px}
-.az6-controls{display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
-.az6-controls select{background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:6px;padding:8px 12px;font-size:13px;min-width:180px;cursor:pointer}
-.az6-controls select:focus{outline:none;border-color:#2563eb}
-.az6-btn{padding:8px 16px;border-radius:6px;border:none;font-size:13px;font-weight:600;cursor:pointer;transition:background .2s}
-.az6-btn-primary{background:#2563eb;color:#fff}.az6-btn-primary:hover{background:#1d4ed8}.az6-btn-primary:disabled{background:#374151;color:#6b7280;cursor:not-allowed}
-.az6-btn-success{background:#059669;color:#fff}.az6-btn-success:hover{background:#047857}
-.az6-btn-close{background:#374151;color:#e5e7eb}.az6-btn-close:hover{background:#4b5563}
-.az6-btn-refresh{background:#374151;color:#e5e7eb;font-size:12px;padding:6px 12px}.az6-btn-refresh:hover{background:#4b5563}
-.az6-btn-optics{background:#0891b2;color:#fff}.az6-btn-optics:hover{background:#0e7490}
-#az6-status{font-size:13px;margin-bottom:12px;min-height:20px;padding:6px 0}
-#az6-status.az6-success{color:#34d399}#az6-status.az6-error{color:#f87171}#az6-status.az6-info{color:#60a5fa}
-.az6-alert-banner{border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;display:none}
-.az6-alert-lost{background:#78350f;border:1px solid #d97706;color:#fde68a}
-.az6-alert-rejected{background:#7f1d1d;border:1px solid #dc2626;color:#fca5a5}
-.az6-alert-midday{background:#064e3b;border:1px solid #059669;color:#6ee7b7}
-.az6-alert-banner strong{display:block;margin-bottom:4px;font-size:14px}
-.az6-alert-banner ul{margin:4px 0 0 16px;padding:0}.az6-alert-banner li{margin:2px 0}
-#az6-results-table{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:12px}
-#az6-results-table th{background:#1f2937;color:#9ca3af;font-weight:600;text-align:left;padding:8px 10px;border-bottom:1px solid #374151;position:sticky;top:0}
-#az6-results-table td{padding:6px 10px;border-bottom:1px solid #1f2937;color:#d1d5db}
-#az6-results-table tr:hover td{background:#1f2937}
-#az6-results-table tr.az6-row-lost td{background:#422006;color:#fde68a}
-#az6-results-table tr.az6-row-rejected td{background:#450a0a;color:#fca5a5;text-decoration:line-through}
-#az6-results-table tr.az6-row-midday-blue td{background:#0c1a3d;color:#93c5fd}
-#az6-results-table tr.az6-row-midday-blue:hover td{background:#172554}
-#az6-results-table tr.az6-row-midday-green td{background:#052e16;color:#86efac}
-#az6-results-table tr.az6-row-midday-green:hover td{background:#064e3b}
-#az6-results-table tr.az6-site-divider td{background:#0f172a;padding:2px;border-bottom:2px solid #374151}
-.az6-tag-midday{display:inline-block;font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;margin-left:4px;vertical-align:middle;color:#fff}
-.az6-tag-midday-blue{background:#2563eb}
-.az6-tag-midday-green{background:#059669}
-#az6-table-container{max-height:300px;overflow-y:auto;border:1px solid #374151;border-radius:6px;margin-bottom:16px;display:none}
-#az6-output-box{background:#064e3b;border:1px solid #065f46;border-radius:6px;padding:12px;font-family:'Consolas','Monaco',monospace;font-size:12px;color:#6ee7b7;white-space:pre;overflow-x:auto;max-height:180px;overflow-y:auto;margin-bottom:12px;display:none}
-#az6-copy-row{display:none;gap:12px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
-#az6-stats{font-size:12px;color:#9ca3af;margin-bottom:12px;display:none}
-.az6-header-row{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px}
-.az6-copy-hint{font-size:11px;color:#6b7280;width:100%;margin-top:4px}
-#az6-optics-copy-row{display:none;gap:12px;align-items:center;margin-bottom:8px;flex-wrap:wrap;padding:10px 12px;background:#0c4a6e;border:1px solid #0369a1;border-radius:6px}
-#az6-optics-copy-row .az6-optics-hint{font-size:11px;color:#7dd3fc;width:100%;margin-top:4px}
-    `;
-    document.head.appendChild(styles);
+    const sty=document.createElement('style');
+    sty.textContent=`
+#azg-fab{position:fixed;bottom:30px;right:30px;width:56px;height:56px;border-radius:50%;background:#2563eb;color:#fff;font-size:14px;font-weight:700;border:none;cursor:pointer;z-index:2147483647;box-shadow:0 4px 14px rgba(37,99,235,.4);display:flex;align-items:center;justify-content:center;transition:transform .2s,box-shadow .2s;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+#azg-fab:hover{transform:scale(1.1);box-shadow:0 6px 20px rgba(37,99,235,.6)}
+#azg-fab.azg-loading{animation:azg-pulse 1.2s infinite;background:#1d4ed8}
+@keyframes azg-pulse{0%,100%{box-shadow:0 4px 14px rgba(37,99,235,.4)}50%{box-shadow:0 4px 24px rgba(37,99,235,.8)}}
+#azg-popup-overlay{position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,.6);z-index:2147483646;display:none;align-items:center;justify-content:center}
+#azg-popup-overlay.azg-visible{display:flex}
+#azg-popup{background:#111827;border:1px solid #374151;border-radius:12px;width:960px;max-width:94vw;max-height:88vh;overflow-y:auto;padding:24px;color:#e5e7eb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;box-shadow:0 25px 60px rgba(0,0,0,.5)}
+#azg-popup h2{margin:0 0 4px;font-size:20px;color:#fff}
+#azg-popup .azg-sub{color:#9ca3af;font-size:12px;margin-bottom:16px}
+#azg-file-info{background:#1f2937;border:1px solid #374151;border-radius:6px;padding:10px 14px;margin-bottom:16px;display:flex;align-items:center;gap:10px}
+#azg-file-info .azg-fi{font-size:20px}
+#azg-file-info .azg-fd{flex:1}
+#azg-file-info .azg-fn{color:#34d399;font-weight:600;font-size:13px}
+#azg-file-info .azg-fs{color:#6b7280;font-size:11px;margin-top:2px}
+.azg-ctrl{display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+.azg-ctrl select{background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:6px;padding:8px 12px;font-size:13px;min-width:120px;cursor:pointer}
+#azg-az-sel{min-width:90px;font-weight:700;border-color:#2563eb;color:#60a5fa}
+.azg-ctrl select:focus{outline:none;border-color:#2563eb}
+.azg-btn{padding:8px 16px;border-radius:6px;border:none;font-size:13px;font-weight:600;cursor:pointer;transition:background .2s}
+.azg-btn-p{background:#2563eb;color:#fff}.azg-btn-p:hover{background:#1d4ed8}.azg-btn-p:disabled{background:#374151;color:#6b7280;cursor:not-allowed}
+.azg-btn-s{background:#059669;color:#fff}.azg-btn-s:hover{background:#047857}
+.azg-btn-c{background:#374151;color:#e5e7eb}.azg-btn-c:hover{background:#4b5563}
+.azg-btn-r{background:#374151;color:#e5e7eb;font-size:12px;padding:6px 12px}.azg-btn-r:hover{background:#4b5563}
+.azg-btn-o{background:#0891b2;color:#fff}.azg-btn-o:hover{background:#0e7490}
+#azg-st{font-size:13px;margin-bottom:12px;min-height:20px;padding:6px 0}
+#azg-st.azg-ok{color:#34d399}#azg-st.azg-err{color:#f87171}#azg-st.azg-inf{color:#60a5fa}
+.azg-ab{border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;display:none}
+.azg-ab-l{background:#78350f;border:1px solid #d97706;color:#fde68a}
+.azg-ab-r{background:#7f1d1d;border:1px solid #dc2626;color:#fca5a5}
+.azg-ab-m{background:#064e3b;border:1px solid #059669;color:#6ee7b7}
+.azg-ab strong{display:block;margin-bottom:4px;font-size:14px}
+.azg-ab ul{margin:4px 0 0 16px;padding:0}.azg-ab li{margin:2px 0}
+#azg-tbl{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:12px}
+#azg-tbl th{background:#1f2937;color:#9ca3af;font-weight:600;text-align:left;padding:8px 10px;border-bottom:1px solid #374151;position:sticky;top:0}
+#azg-tbl td{padding:6px 10px;border-bottom:1px solid #1f2937;color:#d1d5db}
+#azg-tbl tr:hover td{background:#1f2937}
+#azg-tbl tr.azg-rl td{background:#422006;color:#fde68a}
+#azg-tbl tr.azg-rr td{background:#450a0a;color:#fca5a5;text-decoration:line-through}
+#azg-tbl tr.azg-rm td{background:#1e1b4b;color:#c4b5fd}
+#azg-tbl tr.azg-rm:hover td{background:#312e81}
+#azg-tbl tr.azg-sd td{background:#0f172a;padding:2px;border-bottom:2px solid #374151}
+.azg-tag{display:inline-block;font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;margin-left:4px;vertical-align:middle;color:#fff}
+.azg-tag-m{background:#7c3aed}.azg-tag-l{background:#d97706}.azg-tag-j{background:#dc2626}
+.azg-mt{background:none;border:1px solid #4b5563;border-radius:4px;color:#9ca3af;font-size:11px;padding:2px 6px;cursor:pointer;transition:all .15s;vertical-align:middle}
+.azg-mt:hover{border-color:#7c3aed;color:#c4b5fd;background:#1e1b4b}
+.azg-mt.azg-im{border-color:#7c3aed;color:#c4b5fd;background:#312e81}
+.azg-mt.azg-im:hover{border-color:#ef4444;color:#fca5a5;background:#450a0a}
+#azg-tc{max-height:300px;overflow-y:auto;border:1px solid #374151;border-radius:6px;margin-bottom:16px;display:none}
+#azg-ob{background:#064e3b;border:1px solid #065f46;border-radius:6px;padding:12px;font-family:'Consolas','Monaco',monospace;font-size:12px;color:#6ee7b7;white-space:pre;overflow-x:auto;max-height:180px;overflow-y:auto;margin-bottom:12px;display:none}
+#azg-cr{display:none;gap:12px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+#azg-stats{font-size:12px;color:#9ca3af;margin-bottom:12px;display:none}
+.azg-hr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px}
+.azg-ch{font-size:11px;color:#6b7280;width:100%;margin-top:4px}
+#azg-ocr{display:none;gap:12px;align-items:center;margin-bottom:8px;flex-wrap:wrap;padding:10px 12px;background:#0c4a6e;border:1px solid #0369a1;border-radius:6px}
+#azg-ocr .azg-oh{font-size:11px;color:#7dd3fc;width:100%;margin-top:4px}
+.azg-oc{font-size:11px;color:#db2777;margin-left:8px}`;
+    document.head.appendChild(sty);
 
     // === UI ===
-    const fab = document.createElement('button');
-    fab.id = 'az6-fab'; fab.textContent = '6az';
-    fab.title = '6az Position Grabber — Click to grab from current sheet';
-    document.body.appendChild(fab);
-
-    const overlay = document.createElement('div');
-    overlay.id = 'az6-popup-overlay';
-    overlay.innerHTML = `<div id="az6-popup">
-        <div class="az6-header-row"><div><h2>6az Position Grabber</h2>
-        <div class="az6-subtitle">Auto-extract rack positions — grouped by site, 2-row gaps — values only — v2.9.0 (midday-aware: blue + green)</div></div>
-        <button class="az6-btn az6-btn-close" id="az6-close-btn">Close</button></div>
-        <div id="az6-file-info" style="display:none"><div class="az6-file-icon">📊</div>
-        <div class="az6-file-details"><div class="az6-file-name" id="az6-detected-name">—</div>
-        <div class="az6-file-source" id="az6-detected-source">—</div></div>
-        <button class="az6-btn az6-btn-refresh" id="az6-refresh-btn">↻ Re-fetch</button></div>
-        <div class="az6-controls"><select id="az6-sheet-select" disabled><option value="">-- Select Sheet --</option></select>
-        <button class="az6-btn az6-btn-primary" id="az6-grab-btn" disabled>Grab 6az Positions</button></div>
-        <div id="az6-status"></div>
-        <div class="az6-alert-banner az6-alert-midday" id="az6-alert-midday"><strong>🟢🔵 MIDDAY POSITIONS DETECTED</strong><div id="az6-midday-info"></div></div>
-        <div class="az6-alert-banner az6-alert-lost" id="az6-alert-lost"><strong>⚠️ LOST RESERVATIONS — Need to Re-Reserve!</strong><ul id="az6-lost-list"></ul></div>
-        <div class="az6-alert-banner az6-alert-rejected" id="az6-alert-rejected"><strong>🚫 REJECTED POSITIONS</strong><ul id="az6-rejected-list"></ul></div>
-        <div id="az6-stats"></div>
-        <div id="az6-table-container"><table id="az6-results-table"><thead><tr>
-        <th>Site</th><th>Position</th><th>Uplink Config</th><th>Asset</th><th>Rack Type</th><th>Rack Land Date</th><th>Brick</th><th>Notes</th>
-        </tr></thead><tbody id="az6-results-body"></tbody></table></div>
-        <div id="az6-output-box"></div>
-        <div id="az6-copy-row"><button class="az6-btn az6-btn-success" id="az6-copy-btn">📋 Copy Cabling (Clean)</button>
-        <button class="az6-btn az6-btn-primary" id="az6-copy-all-btn">📋 Copy Cabling (With Alerts)</button>
-        <span id="az6-copy-status" style="font-size:12px;color:#34d399"></span>
-        <div class="az6-copy-hint">Cabling only — midday (blue/green) rows excluded. Paste into row below header (Col A). Grouped by site with 2-row gaps.</div></div>
-        <div id="az6-optics-copy-row"><button class="az6-btn az6-btn-optics" id="az6-copy-optics-btn">🔬 Copy Optics (All)</button>
-        <span id="az6-optics-copy-status" style="font-size:12px;color:#7dd3fc"></span>
-        <div class="az6-optics-hint">Optics includes morning + midday (blue/green) positions. 6-col TSV (Site · Position · Uplink Config · Asset · Brick · Land Date). Paste into Col A of the optics workload. Blank row between sites.</div></div>
-    </div>`;
+    const fab=document.createElement('button');fab.id='azg-fab';fab.textContent='AZ';fab.title='AZGrab — Click to grab positions';document.body.appendChild(fab);
+    const overlay=document.createElement('div');overlay.id='azg-popup-overlay';
+    overlay.innerHTML=`<div id="azg-popup"><div class="azg-hr"><div><h2>AZGrab</h2><div class="azg-sub">Auto-extract rack positions — grouped by site, 2-row gaps — v4.1.1 (multi-AZ, midday detection + per-row override)</div></div><button class="azg-btn azg-btn-c" id="azg-close">Close</button></div><div id="azg-file-info" style="display:none"><div class="azg-fi">📊</div><div class="azg-fd"><div class="azg-fn" id="azg-fname">—</div><div class="azg-fs" id="azg-fsrc">—</div></div><button class="azg-btn azg-btn-r" id="azg-refresh">↻ Re-fetch</button></div><div class="azg-ctrl"><select id="azg-az-sel"><option value="1/62AZ">1/62AZ</option><option value="6AZ" selected>6AZ</option><option value="7/55AZ">7/55AZ</option><option value="12AZ">12AZ</option></select><select id="azg-sh-sel" disabled><option value="">-- Select Sheet --</option></select><button class="azg-btn azg-btn-p" id="azg-grab" disabled>Grab Positions</button></div><div id="azg-st"></div><div class="azg-ab azg-ab-m" id="azg-am"><strong>⏫ MIDDAY POSITIONS DETECTED</strong><div id="azg-mi"></div></div><div class="azg-ab azg-ab-l" id="azg-al"><strong>⚠️ LOST RESERVATIONS</strong><ul id="azg-ll"></ul></div><div class="azg-ab azg-ab-r" id="azg-ar"><strong>🚫 REJECTED POSITIONS</strong><ul id="azg-rl2"></ul></div><div id="azg-stats"></div><div id="azg-tc"><table id="azg-tbl"><thead><tr><th>Site</th><th>Position</th><th>Uplink</th><th>Asset</th><th>Rack Type</th><th>Land Date</th><th>Brick</th><th>Midday</th><th>Notes</th></tr></thead><tbody id="azg-tbody"></tbody></table></div><div id="azg-ob"></div><div id="azg-cr"><button class="azg-btn azg-btn-s" id="azg-copy">📋 Copy Cabling (Clean)</button><button class="azg-btn azg-btn-p" id="azg-copya">📋 Copy Cabling (With Alerts)</button><span id="azg-cs" style="font-size:12px;color:#34d399"></span><div class="azg-ch">Cabling only — midday excluded. Paste into Col A. Grouped by site with 2-row gaps.</div></div><div id="azg-ocr"><button class="azg-btn azg-btn-o" id="azg-copyo">🔬 Copy Optics (All)</button><span id="azg-os" style="font-size:12px;color:#7dd3fc"></span><div class="azg-oh">Optics = morning + midday. 6-col TSV. Paste into Col A of optics workload.</div></div></div>`;
     document.body.appendChild(overlay);
 
     // === REFS ===
-    const fileInfoEl=document.getElementById('az6-file-info'), detectedNameEl=document.getElementById('az6-detected-name'),
-        detectedSourceEl=document.getElementById('az6-detected-source'), refreshBtn=document.getElementById('az6-refresh-btn'),
-        sheetSelect=document.getElementById('az6-sheet-select'), grabBtn=document.getElementById('az6-grab-btn'),
-        statusEl=document.getElementById('az6-status'), statsEl=document.getElementById('az6-stats'),
-        alertLostEl=document.getElementById('az6-alert-lost'), lostListEl=document.getElementById('az6-lost-list'),
-        alertRejectedEl=document.getElementById('az6-alert-rejected'), rejectedListEl=document.getElementById('az6-rejected-list'),
-        alertMiddayEl=document.getElementById('az6-alert-midday'), middayInfoEl=document.getElementById('az6-midday-info'),
-        tableContainer=document.getElementById('az6-table-container'), resultsBody=document.getElementById('az6-results-body'),
-        outputBox=document.getElementById('az6-output-box'), copyRow=document.getElementById('az6-copy-row'),
-        copyBtn=document.getElementById('az6-copy-btn'), copyAllBtn=document.getElementById('az6-copy-all-btn'),
-        copyStatus=document.getElementById('az6-copy-status'), closeBtn=document.getElementById('az6-close-btn'),
-        opticsCopyRow=document.getElementById('az6-optics-copy-row'), copyOpticsBtn=document.getElementById('az6-copy-optics-btn'),
-        opticsCopyStatus=document.getElementById('az6-optics-copy-status');
+    const azSel=document.getElementById('azg-az-sel'),fileInfo=document.getElementById('azg-file-info'),fnameEl=document.getElementById('azg-fname'),fsrcEl=document.getElementById('azg-fsrc'),refreshBtn=document.getElementById('azg-refresh'),shSel=document.getElementById('azg-sh-sel'),grabBtn=document.getElementById('azg-grab'),stEl=document.getElementById('azg-st'),statsEl=document.getElementById('azg-stats'),alEl=document.getElementById('azg-al'),llEl=document.getElementById('azg-ll'),arEl=document.getElementById('azg-ar'),rlEl=document.getElementById('azg-rl2'),amEl=document.getElementById('azg-am'),miEl=document.getElementById('azg-mi'),tcEl=document.getElementById('azg-tc'),tbody=document.getElementById('azg-tbody'),obEl=document.getElementById('azg-ob'),crEl=document.getElementById('azg-cr'),copyBtn=document.getElementById('azg-copy'),copyaBtn=document.getElementById('azg-copya'),csEl=document.getElementById('azg-cs'),closeBtn=document.getElementById('azg-close'),ocrEl=document.getElementById('azg-ocr'),copyoBtn=document.getElementById('azg-copyo'),osEl=document.getElementById('azg-os');
 
-    let workbook = null, currentFileUrl = null, lastGrabbedRows = [];
+    let workbook=null, lastRows=[];
 
     // === HELPERS ===
-    function isTarget6az(v) { return v && v.toUpperCase().trim() === TARGET_AZ; }
-    function isValidRackType(rt) { if (!rt) return false; const u=rt.toUpperCase().trim(); return VALID_RACK_PREFIXES.some(p=>u.startsWith(p)); }
-    function isExcelFile(url) { return /\.(xlsx|xlsm|xls)/i.test(url); }
-    function getFileNameFromPath(url) { try { const p=decodeURIComponent(url.split('?')[0]).split('/'); return p[p.length-1]||null; } catch(e){ return null; } }
+    function isAZ(v){if(!v)return false;const u=v.toUpperCase().trim(),cfg=AZ_MAP[selectedAZ];return cfg?cfg.match.includes(u):false;}
+    function isRack(rt){if(!rt)return false;const u=rt.toUpperCase().trim();return VALID_RACK_PREFIXES.some(p=>u.startsWith(p));}
+    function isXls(u){return/\.(xlsx|xlsm|xls)/i.test(u);}
+    function fname(u){try{const p=decodeURIComponent(u.split('?')[0]).split('/');return p[p.length-1]||null;}catch(e){return null;}}
+    function setSt(m,t){stEl.textContent=m;stEl.className='';if(t==='success')stEl.classList.add('azg-ok');else if(t==='error')stEl.classList.add('azg-err');else if(t==='info')stEl.classList.add('azg-inf');}
+    function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+    function sortSite(rows){return rows.sort((a,b)=>{const sA=a.site.toUpperCase(),sB=b.site.toUpperCase(),pA=sA.match(/(\d+|\D+)/g)||[],pB=sB.match(/(\d+|\D+)/g)||[];for(let i=0;i<Math.max(pA.length,pB.length);i++){const x=pA[i]||'',y=pB[i]||'',nA=parseInt(x,10),nB=parseInt(y,10);if(!isNaN(nA)&&!isNaN(nB)){if(nA!==nB)return nA-nB;}else{if(x<y)return-1;if(x>y)return 1;}}return a.position.localeCompare(b.position,undefined,{numeric:true});});}
+    function grpSite(rows){const gs=[],m=new Map();rows.forEach(r=>{const k=r.site.toUpperCase().trim();if(!m.has(k)){const g={site:r.site,rows:[]};m.set(k,g);gs.push(g);}m.get(k).rows.push(r);});return gs;}
 
-    function setStatus(msg, type) {
-        statusEl.textContent = msg; statusEl.className = '';
-        if (type==='success') statusEl.classList.add('az6-success');
-        else if (type==='error') statusEl.classList.add('az6-error');
-        else if (type==='info') statusEl.classList.add('az6-info');
-    }
-    function esc(str) { const d=document.createElement('div'); d.textContent=str; return d.innerHTML; }
-
-    function sortBySite(rows) {
-        return rows.sort((a,b)=>{
-            const sA=a.site.toUpperCase(), sB=b.site.toUpperCase();
-            const pA=sA.match(/(\d+|\D+)/g)||[], pB=sB.match(/(\d+|\D+)/g)||[];
-            for (let i=0;i<Math.max(pA.length,pB.length);i++){
-                const x=pA[i]||'', y=pB[i]||'', nA=parseInt(x,10), nB=parseInt(y,10);
-                if (!isNaN(nA)&&!isNaN(nB)){ if(nA!==nB) return nA-nB; }
-                else { if(x<y) return -1; if(x>y) return 1; }
-            }
-            return a.position.localeCompare(b.position,undefined,{numeric:true});
-        });
-    }
-    function groupBySite(rows) {
-        const groups=[], map=new Map();
-        rows.forEach(r=>{ const k=r.site.toUpperCase().trim();
-            if(!map.has(k)){ const g={site:r.site,rows:[]}; map.set(k,g); groups.push(g); }
-            map.get(k).rows.push(r); });
-        return groups;
-    }
-
-    // === SAFE GUID EXTRACTION ===
-    function cleanSourceDocGuid(raw) {
-        if (!raw) return '';
-        let s = raw;
-        for (let i=0;i<2;i++){ try{ const d=decodeURIComponent(s); if(d===s) break; s=d; }catch(e){break;} }
-        return s.replace(/[{}\s]/g, '').trim();
-    }
-    function formatGuid(guid) {
-        if (!guid) return '';
-        const c = guid.replace(/[^a-fA-F0-9]/g, '');
-        if (c.length !== 32) return guid;
-        return c.substring(0,8)+'-'+c.substring(8,12)+'-'+c.substring(12,16)+'-'+c.substring(16,20)+'-'+c.substring(20,32);
-    }
+    // === GUID ===
+    function cleanGuid(raw){if(!raw)return'';let s=raw;for(let i=0;i<2;i++){try{const d=decodeURIComponent(s);if(d===s)break;s=d;}catch(e){break;}}return s.replace(/[{}\s]/g,'').trim();}
+    function fmtGuid(g){if(!g)return'';const c=g.replace(/[^a-fA-F0-9]/g,'');if(c.length!==32)return g;return c.substring(0,8)+'-'+c.substring(8,12)+'-'+c.substring(12,16)+'-'+c.substring(16,20)+'-'+c.substring(20,32);}
 
     // === FILE URL DETECTION ===
-    function detectExcelFileUrl() {
-        const pageUrl=window.location.href, params=new URLSearchParams(window.location.search);
-        const sourcedoc=params.get('sourcedoc'), fileParam=params.get('file');
-
-        if (sourcedoc && pageUrl.includes('/_layouts/')) {
-            const sitePath = extractSitePath(pageUrl);
-            const cleanGuid = formatGuid(cleanSourceDocGuid(sourcedoc));
-            console.log('[6az] sourcedoc raw:', sourcedoc, '→ cleanGuid:', cleanGuid);
-            const wopiSrc = findWopiSrc(params, pageUrl);
-            return { url:buildApiUrl(sitePath,cleanGuid), type:'sourcedoc', guid:cleanGuid,
-                     fileName:fileParam?decodeURIComponent(fileParam):null, sitePath, wopiSrc };
-        }
-        if (pageUrl.includes('officeapps.live.com')) {
-            const src=params.get('src')||params.get('wdOrigin');
-            if (src&&isExcelFile(src)) return {url:src,type:'officeapps-src',fileName:getFileNameFromPath(src)};
-            const wopiSrc=params.get('WOPISrc')||params.get('wopisrc');
-            if (wopiSrc) return {url:wopiSrc+'/contents',type:'wopi',fileName:fileParam};
-        }
-        if (/\.(xlsx|xlsm|xls)(\?|$|#)/i.test(pageUrl)) { const u=pageUrl.split('?')[0]; return {url:u,type:'direct',fileName:getFileNameFromPath(u)}; }
-        const idParam=params.get('id');
-        if (idParam&&isExcelFile(idParam)) { const fp=idParam.startsWith('/')?idParam:'/'+idParam; return {url:window.location.origin+fp,type:'id-param',fileName:getFileNameFromPath(idParam)}; }
+    function detectFile(){
+        const url=window.location.href,p=new URLSearchParams(window.location.search),sd=p.get('sourcedoc'),fp=p.get('file');
+        if(sd&&url.includes('/_layouts/')){const sp=extSite(url),cg=fmtGuid(cleanGuid(sd)),ws=findWopi(p,url);return{url:apiUrl(sp,cg),type:'sourcedoc',guid:cg,fileName:fp?decodeURIComponent(fp):null,sitePath:sp,wopiSrc:ws};}
+        if(url.includes('officeapps.live.com')){const src=p.get('src')||p.get('wdOrigin');if(src&&isXls(src))return{url:src,type:'officeapps',fileName:fname(src)};const ws=p.get('WOPISrc')||p.get('wopisrc');if(ws)return{url:ws+'/contents',type:'wopi',fileName:fp};}
+        if(/\.(xlsx|xlsm|xls)(\?|$|#)/i.test(url)){const u=url.split('?')[0];return{url:u,type:'direct',fileName:fname(u)};}
+        const id=p.get('id');if(id&&isXls(id)){const fp2=id.startsWith('/')?id:'/'+id;return{url:window.location.origin+fp2,type:'id-param',fileName:fname(id)};}
         return null;
     }
-    function findWopiSrc(params, pageUrl) {
-        const d=params.get('WOPISrc')||params.get('wopisrc'); if(d) return d;
-        const m=pageUrl.match(/(https?:\/\/[^&\s]+_vti_bin\/wopi\.ashx\/files\/[a-f0-9]+)/i);
-        return m?m[1]:null;
-    }
-    function extractSitePath(url) {
-        try{ let p=new URL(url).pathname; p=p.replace(/^\/:x:\/[rs]\//,'/');
-            const m=p.match(/^(\/(?:sites|teams)\/[^/]+)/i); if(m) return m[1]; }catch(e){}
-        return '';
-    }
-    function buildApiUrl(sitePath, guid) {
-        const base=sitePath?window.location.origin+sitePath:window.location.origin;
-        return base+`/_api/web/GetFileById('${guid}')/$value`;
-    }
+    function findWopi(p,url){const d=p.get('WOPISrc')||p.get('wopisrc');if(d)return d;const m=url.match(/(https?:\/\/[^&\s]+_vti_bin\/wopi\.ashx\/files\/[a-f0-9]+)/i);return m?m[1]:null;}
+    function extSite(url){try{let p=new URL(url).pathname;p=p.replace(/^\/:x:\/[rs]\//,'/');const m=p.match(/^(\/(?:sites|teams)\/[^/]+)/i);if(m)return m[1];}catch(e){}return'';}
+    function apiUrl(sp,guid){const base=sp?window.location.origin+sp:window.location.origin;return base+`/_api/web/GetFileById('${guid}')/$value`;}
 
     // === RESPONSE GUARD ===
-    function validateBinaryResponse(buf) {
-        if (!buf||buf.byteLength===0) return {ok:false,reason:'Empty response (0 bytes).'};
+    function validateBin(buf){
+        if(!buf||buf.byteLength===0)return{ok:false,reason:'Empty response.'};
         const u=new Uint8Array(buf);
-        if ((u[0]===0x50&&u[1]===0x4B&&u[2]===0x03&&u[3]===0x04)||(u[0]===0xD0&&u[1]===0xCF&&u[2]===0x11&&u[3]===0xE0)) return {ok:true};
-        let txt='';
-        try{ txt=new TextDecoder('utf-8',{fatal:false}).decode(u.slice(0,2000)).trim(); }catch(e){ return {ok:false,reason:'Unknown binary format.'}; }
+        if((u[0]===0x50&&u[1]===0x4B&&u[2]===0x03&&u[3]===0x04)||(u[0]===0xD0&&u[1]===0xCF&&u[2]===0x11&&u[3]===0xE0))return{ok:true};
+        let txt='';try{txt=new TextDecoder('utf-8',{fatal:false}).decode(u.slice(0,2000)).trim();}catch(e){return{ok:false,reason:'Unknown format.'};}
         const lw=txt.toLowerCase();
-        if (lw.includes('<!doctype')||lw.includes('<html')||lw.includes('<head')){
-            if (lw.includes('sign in')||lw.includes('login')||lw.includes('idpinitiatedsignon')||lw.includes('microsoftonline'))
-                return {ok:false,reason:'SharePoint returned a login page. Refresh and sign in again.'};
-            if (lw.includes('access denied')||lw.includes('403')||lw.includes('unauthorized'))
-                return {ok:false,reason:'SharePoint returned Access Denied.'};
-            if (lw.includes('404')||lw.includes('not found'))
-                return {ok:false,reason:'SharePoint returned 404 Not Found.'};
-            return {ok:false,reason:'SharePoint returned HTML instead of the Excel file.'};
-        }
-        if (lw.startsWith('{')&&(lw.includes('"error"')||lw.includes('"odata.error"'))){
-            try{ const e=JSON.parse(txt); return {ok:false,reason:'SP API error: '+(e?.['odata.error']?.message?.value||e?.error?.message?.value||'Unknown')}; }
-            catch(e){ return {ok:false,reason:'SP API returned JSON error.'}; }
-        }
-        if (txt.length>0&&/^[\x20-\x7E\r\n\t]+$/.test(txt.substring(0,200)))
-            return {ok:false,reason:'Response is plain text: '+txt.substring(0,200)};
-        return {ok:true};
+        if(lw.includes('<!doctype')||lw.includes('<html')){if(lw.includes('sign in')||lw.includes('login')||lw.includes('microsoftonline'))return{ok:false,reason:'Login page returned. Sign in again.'};if(lw.includes('access denied')||lw.includes('403'))return{ok:false,reason:'Access Denied.'};if(lw.includes('404'))return{ok:false,reason:'404 Not Found.'};return{ok:false,reason:'HTML returned instead of Excel.'};}
+        if(lw.startsWith('{')||lw.startsWith('['))return{ok:false,reason:'JSON returned instead of Excel.'};
+        return{ok:true};
     }
 
-    // === AUTH ===
-    const SP_AUTH_HEADERS = {'Accept':'application/octet-stream','X-FORMS_BASED_AUTH_ACCEPTED':'f','Cache-Control':'no-cache'};
-
-    async function fetchRequestDigest(sitePath) {
-        const base=(sitePath?window.location.origin+sitePath:window.location.origin);
-        try{ const r=await fetch(base+'/_api/contextinfo',{method:'POST',credentials:'include',
-            headers:{'Accept':'application/json;odata=verbose','Content-Length':'0','X-FORMS_BASED_AUTH_ACCEPTED':'f'}});
-            if(!r.ok)return null; const j=await r.json(); return j?.d?.GetContextWebInformation?.FormDigestValue||null;
-        }catch(e){ console.log('[6az] digest fail:',e.message); return null; }
+    // === FETCH ===
+    async function fetchXls(fi){
+        const strats=[];
+        if(fi.sitePath&&fi.guid)strats.push({n:'download.aspx',u:window.location.origin+fi.sitePath+'/_layouts/15/download.aspx?UniqueId='+fi.guid});
+        strats.push({n:'GetFileById',u:fi.url});
+        if(fi.wopiSrc)strats.push({n:'WOPI',u:fi.wopiSrc+'/contents'});
+        for(const s of strats){console.log('[azg] Trying:',s.n);setSt('Fetching ('+s.n+')...','info');try{const buf=await fetchBin(s.u);const chk=validateBin(buf);if(chk.ok){console.log('[azg] ✓',s.n,buf.byteLength,'bytes');return buf;}console.warn('[azg] ✗',s.n,chk.reason);}catch(e){console.warn('[azg] ✗',s.n,e.message);}}
+        throw new Error('All fetch strategies failed. Check SharePoint sign-in.');
     }
+    function fetchBin(url){return new Promise((res,rej)=>{const nc=!url.includes(window.location.hostname);if(typeof GM_xmlhttpRequest!=='undefined'&&nc){GM_xmlhttpRequest({method:'GET',url,responseType:'arraybuffer',headers:{'Accept':'application/octet-stream'},onload(r){r.status>=200&&r.status<300?res(r.response):rej(new Error('HTTP '+r.status));},onerror(){rej(new Error('Network error'));}});}else{fetch(url,{credentials:'include',headers:{'Accept':'application/octet-stream'}}).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.arrayBuffer();}).then(res).catch(rej);}});}
 
-    // === FETCH STRATEGIES ===
-    function buildFetchStrategies(detected) {
-        const o=window.location.origin, s=[];
-        if (detected.guid&&detected.sitePath)
-            s.push({label:'download.aspx',url:o+detected.sitePath+`/_layouts/15/download.aspx?UniqueId=${detected.guid}`,needsDigest:false});
-        if (detected.guid&&detected.sitePath)
-            s.push({label:'GetFileById',url:buildApiUrl(detected.sitePath,detected.guid),needsDigest:true});
-        if (detected.wopiSrc)
-            s.push({label:'WOPI-contents',url:detected.wopiSrc+'/contents',needsDigest:false});
-        if (detected.guid&&detected.sitePath&&!detected.wopiSrc){
-            const flat=detected.guid.replace(/-/g,'').toLowerCase();
-            s.push({label:'WOPI-constructed',url:o+detected.sitePath+'/_vti_bin/wopi.ashx/files/'+flat+'/contents',needsDigest:false});
-        }
-        if (detected.type!=='sourcedoc'&&detected.url)
-            s.push({label:'direct-url',url:detected.url,needsDigest:false});
-        return s;
+    // === MIDDAY TOGGLE ===
+    function toggleMD(entry,btn){
+        entry.isMidday=!entry.isMidday;entry.isOverride=true;
+        entry.notes=entry.notes.filter(n=>n!=='MIDDAY'&&n!=='MIDDAY ✎');
+        if(entry.isMidday)entry.notes.push('MIDDAY ✎');
+        btn.textContent=entry.isMidday?'☀ Remove':'🌙 Add';
+        btn.title=entry.isMidday?'Remove from midday (move to cabling)':'Mark as midday (optics only)';
+        btn.classList.toggle('azg-im',entry.isMidday);
+        btn.closest('tr').classList.toggle('azg-rm',entry.isMidday);
+        refreshStats();
+        console.log('[azg] Toggle:',entry.site,entry.position,'→',entry.isMidday?'MIDDAY':'MORNING','(override)');
     }
-
-    // === MULTI-STRATEGY FETCH ===
-    async function fetchExcelFile(detected) {
-        const strategies=buildFetchStrategies(detected); let digest=null, lastError='No strategies available.';
-        for (const strat of strategies){
-            console.log('[6az] Trying:',strat.label,'→',strat.url);
-            const headers={...SP_AUTH_HEADERS};
-            if (strat.needsDigest&&!digest&&detected.sitePath){ digest=await fetchRequestDigest(detected.sitePath); if(digest) console.log('[6az] Got digest.'); }
-            if (strat.needsDigest&&digest) headers['X-RequestDigest']=digest;
-            if (strat.url.includes('/_api/')) headers['binaryStringResponseBody']='true';
-
-            try{ const r=await fetch(strat.url,{method:'GET',credentials:'include',headers,redirect:'follow'});
-                if(r.ok){ const buf=await r.arrayBuffer(); const c=validateBinaryResponse(buf);
-                    if(c.ok){ console.log('[6az] ✓ fetch()+',strat.label); return new Uint8Array(buf); }
-                    console.warn('[6az] fetch()+',strat.label,'→',c.reason); lastError=c.reason;
-                } else { console.log('[6az] fetch()+',strat.label,'→ HTTP',r.status); lastError='HTTP '+r.status+' from '+strat.label; }
-            }catch(e){ console.log('[6az] fetch()+',strat.label,'→',e.message); lastError=e.message; }
-
-            try{ const gm=await new Promise((res,rej)=>{
-                GM_xmlhttpRequest({method:'GET',url:strat.url,responseType:'arraybuffer',headers,
-                    onload(r){ if(r.status>=200&&r.status<300){ const c=validateBinaryResponse(r.response); c.ok?res(new Uint8Array(r.response)):rej(new Error(c.reason)); } else rej(new Error('HTTP '+r.status)); },
-                    onerror(){ rej(new Error('Network error')); }});});
-                console.log('[6az] ✓ GM+',strat.label); return gm;
-            }catch(e){ console.log('[6az] GM+',strat.label,'→',e.message); lastError=e.message; }
-        }
-        throw new Error(lastError);
-    }
-
-    // === MAIN WORKFLOW ===
-    async function autoGrab() {
-        resetResults(); setStatus('Detecting Excel file...','info'); fab.classList.add('az6-loading');
-        const detected=detectExcelFileUrl();
-        if(!detected){ fab.classList.remove('az6-loading'); setStatus('No Excel file detected. Open an .xlsx/.xlsm in SharePoint first.','error'); overlay.classList.add('az6-visible'); return; }
-        currentFileUrl=detected;
-        const fileName=detected.fileName||getFileNameFromPath(detected.url)||'Unknown File';
-        overlay.classList.add('az6-visible'); fileInfoEl.style.display='flex';
-        detectedNameEl.textContent=fileName;
-        detectedSourceEl.textContent=detected.sitePath?'Site: '+detected.sitePath+' | GUID: '+detected.guid+' | Method: '+detected.type:'Method: '+detected.type;
-        setStatus('Fetching: '+fileName+'...','info');
-        try{
-            const data=await fetchExcelFile(detected);
-            // v2.9.0: cellStyles:true to read fill colors for midday detection
-            workbook=XLSX.read(data,{type:'array',cellStyles:true});
-            sheetSelect.innerHTML='<option value="">-- Select Sheet --</option>';
-            workbook.SheetNames.forEach(n=>{ const o=document.createElement('option'); o.value=n; o.textContent=n; sheetSelect.appendChild(o); });
-            sheetSelect.disabled=false; grabBtn.disabled=false;
-            if(workbook.SheetNames.length===1) sheetSelect.value=workbook.SheetNames[0];
-            fab.classList.remove('az6-loading');
-            setStatus('File loaded! '+workbook.SheetNames.length+' sheet(s). Select a sheet and click Grab.','success');
-            if(workbook.SheetNames.length===1) processSheet();
-        }catch(err){ fab.classList.remove('az6-loading'); setStatus('Error fetching file: '+err.message,'error'); console.error('[6az] Fetch error:',err); }
-    }
-    function resetResults(){
-        resultsBody.innerHTML=''; tableContainer.style.display='none'; outputBox.style.display='none'; outputBox.textContent='';
-        copyRow.style.display='none'; opticsCopyRow.style.display='none'; statsEl.style.display='none';
-        alertLostEl.style.display='none'; alertRejectedEl.style.display='none'; alertMiddayEl.style.display='none';
-        lostListEl.innerHTML=''; rejectedListEl.innerHTML=''; middayInfoEl.innerHTML=''; lastGrabbedRows=[];
+    function refreshStats(){
+        const g=lastRows;if(!g.length)return;
+        const md=g.filter(e=>e.isMidday),mo=g.filter(e=>!e.isMidday),cl=g.filter(e=>!e.isLost&&!e.isRejected),ov=g.filter(e=>e.isOverride),sg=grpSite(g);
+        if(md.length){amEl.style.display='block';const ovn=ov.length?'<br><span class="azg-oc">('+ov.length+' manual override'+(ov.length>1?'s':'')+' ✎)</span>':'';miEl.innerHTML='<strong>'+md.length+' midday position'+(md.length>1?'s':'')+'</strong>'+ovn+'<br>Included in Optics, excluded from Cabling.<ul>'+md.map(e=>'<li>'+esc(e.site)+' — '+esc(e.position)+(e.rackType?' ('+esc(e.rackType)+')':'')+(e.isOverride?' ✎':'')+'</li>').join('')+'</ul>';}else{amEl.style.display='none';}
+        statsEl.textContent=AZ_MAP[selectedAZ].label+': '+g.length+' total | '+mo.length+' morning (cabling) | '+md.length+' midday (optics only) | '+sg.length+' sites | '+g.filter(e=>e.isLost).length+' lost | '+g.filter(e=>e.isRejected).length+' rejected'+(ov.length?' | '+ov.length+' override(s) ✎':'');
+        crEl.style.display=mo.length>0?'flex':'none';
+        ocrEl.style.display=cl.length>0?'flex':'none';
     }
 
     // === PROCESS SHEET ===
     function processSheet(){
-        if(!workbook){setStatus('No file loaded.','error');return;}
-        const sheetName=sheetSelect.value; if(!sheetName){setStatus('Please select a sheet.','error');return;}
-        setStatus('Processing...','info');
-        try{
-            const sheet=workbook.Sheets[sheetName];
-            const rows=XLSX.utils.sheet_to_json(sheet,{defval:''});
-            if(!rows.length){setStatus('No data in sheet.','error');return;}
-            const headers=Object.keys(rows[0]), colMap=findColumns(headers);
-            if(!colMap.az){setStatus('Could not find "AZ" column.','error');return;}
-            if(!colMap.site){setStatus('Could not find "Site" column.','error');return;}
-            if(!colMap.position){setStatus('Could not find "Position" column.','error');return;}
+        if(!workbook){setSt('No workbook loaded.','error');return;}
+        const sn=shSel.value;if(!sn){setSt('Select a sheet first.','error');return;}
+        const sheet=workbook.Sheets[sn];if(!sheet||!sheet['!ref']){setSt('Sheet is empty.','error');return;}
+        setSt('Processing: '+sn+'...','info');
+        tbody.innerHTML='';tcEl.style.display='none';obEl.style.display='none';obEl.textContent='';crEl.style.display='none';ocrEl.style.display='none';csEl.textContent='';osEl.textContent='';alEl.style.display='none';llEl.innerHTML='';arEl.style.display='none';rlEl.innerHTML='';amEl.style.display='none';miEl.innerHTML='';statsEl.style.display='none';statsEl.textContent='';lastRows=[];
 
-            // Determine column count for fill scanning
-            const range = XLSX.utils.decode_range(sheet['!ref'] || 'A1');
-            const colCount = range.e.c + 1;
-            const dataRowOffset = 1; // header is row 0
+        const rows=XLSX.utils.sheet_to_json(sheet,{header:1,raw:false,defval:''});
+        if(rows.length<2){setSt('No data rows.','error');return;}
 
-            let grabbed=[], lostRes=[], rejPos=[], middayRows=[], skipAz=0, skipRt=0;
-            rows.forEach((row, rowIndex)=>{
-                const az=String(row[colMap.az]||'').trim(), site=String(row[colMap.site]||'').trim(), pos=String(row[colMap.position]||'').trim();
-                if(!az||!pos) return; if(!isTarget6az(az)){skipAz++;return;}
-                const rt=String(row[colMap.rackType]||'').trim(); if(rt&&!isValidRackType(rt)){skipRt++;return;}
-                const notes=String(row[colMap.notes]||'').trim(), nl=notes.toLowerCase();
-                const metroVal = colMap.metronomeLength ? String(row[colMap.metronomeLength]||'').trim() : '';
+        let hIdx=-1;
+        for(let i=0;i<Math.min(rows.length,10);i++){const r=rows[i];if(!r)continue;const j=r.map(c=>String(c).toUpperCase().trim()).join('|');if(j.includes('AZ')&&(j.includes('SITE')||j.includes('POSITION')||j.includes('RACK'))){hIdx=i;break;}}
+        if(hIdx===-1){setSt('No header row on "'+sn+'". Try a different sheet.','error');return;}
 
-                // v2.9.0: Detect midday fill (blue or green) on this row
-                const excelRow = rowIndex + dataRowOffset;
-                const middayColor = detectRowMidday(sheet, excelRow, colCount);
-                const isMidDay = middayColor !== null;
+        const hdr=rows[hIdx].map(h=>String(h).toUpperCase().trim());
+        console.log('[azg] Header row',hIdx,':',hdr.join(' | '));
 
-                const entry={site,position:pos,uplinkConfig:String(row[colMap.uplinkConfig]||'').trim(),
-                    asset:String(row[colMap.asset]||'').trim(),rackType:rt,landDate:formatDate(row[colMap.landDate]),
-                    brick:String(row[colMap.brick]||'').trim(),notes,
-                    metronome: metroVal !== '' ? 'TRUE' : 'FALSE',
-                    midday: isMidDay,
-                    middayColor: middayColor}; // 'blue', 'green', or null
+        function fC(...a){for(const x of a){const i=hdr.indexOf(x);if(i>=0)return i;}return-1;}
+        function fP(...a){for(const x of a){const i=hdr.findIndex(h=>h.includes(x));if(i>=0)return i;}return-1;}
 
-                if(ALERT_LOST_RES.some(t=>nl.includes(t))){entry.status='lost';lostRes.push(entry);grabbed.push(entry);return;}
-                if(ALERT_REJECTED.some(t=>nl.includes(t))){entry.status='rejected';rejPos.push(entry);grabbed.push(entry);return;}
-                entry.status='ok'; grabbed.push(entry);
-                if(isMidDay) middayRows.push(entry);
+        const cAZ=fC('AZ'),cSite=fC('SITE','SITE CODE','SITE NAME'),cPos=fC('POSITION','POS','RACK POSITION'),cUp=fP('UPLINK','CONFIG'),cAs=fC('ASSET','ASSET ID','ASSET NUMBER'),cRk=fP('RACK TYPE','TYPE'),cLd=fP('LAND','DATE'),cBr=fC('BRICK','BRICK ID'),cMb=fP('MEASURED');
+        if(cAZ<0||cSite<0||cPos<0){setSt('Missing columns: AZ='+cAZ+' Site='+cSite+' Pos='+cPos+'. Try another sheet.','error');return;}
+
+        const midSep=findMiddaySeparatorRow(sheet);
+        const grabbed=[],lost=[],rejected=[],middays=[];let skip=0;
+
+        for(let i=hIdx+1;i<rows.length;i++){
+            const r=rows[i];if(!r||r.every(c=>!c||String(c).trim()===''))continue;
+            const az=r[cAZ]?String(r[cAZ]).trim():'';if(!isAZ(az)){skip++;continue;}
+            const site=r[cSite]?String(r[cSite]).trim():'',pos=r[cPos]?String(r[cPos]).trim():'';if(!site||!pos){skip++;continue;}
+            const rk=cRk>=0&&r[cRk]?String(r[cRk]).trim():'';if(rk&&!isRack(rk)){skip++;continue;}
+            const up=cUp>=0&&r[cUp]?String(r[cUp]).trim():'',as=cAs>=0&&r[cAs]?String(r[cAs]).trim():'',ld=cLd>=0&&r[cLd]?String(r[cLd]).trim():'',br=cBr>=0&&r[cBr]?String(r[cBr]).trim():'',mb=cMb>=0&&r[cMb]?String(r[cMb]).trim():'';
+            const off=sheet['!ref']?XLSX.utils.decode_range(sheet['!ref']).s.r:0;
+            const isMD=midSep>=0&&(i+off)<=midSep;
+            const allTxt=r.map(c=>String(c).toLowerCase()).join(' ');
+            const isL=ALERT_LOST_RES.some(k=>allTxt.includes(k)),isR=ALERT_REJECTED.some(k=>allTxt.includes(k));
+            const e={site,position:pos,uplink:up,asset:as,rackType:rk,landDate:ld,brick:br,measuredBy:mb,isMidday:isMD,isLost:isL,isRejected:isR,isOverride:false,rowIdx:i,notes:[]};
+            if(isL){e.notes.push('LOST RES');lost.push(e);}if(isR){e.notes.push('REJECTED');rejected.push(e);}if(isMD){e.notes.push('MIDDAY');middays.push(e);}
+            grabbed.push(e);
+        }
+        if(!grabbed.length){setSt('No '+AZ_MAP[selectedAZ].label+' positions on "'+sn+'". Skipped '+skip+'.','error');return;}
+
+        sortSite(grabbed);lastRows=grabbed;
+
+        if(lost.length){alEl.style.display='block';lost.forEach(e=>{const li=document.createElement('li');li.textContent=e.site+' — '+e.position+(e.rackType?' ('+e.rackType+')':'');llEl.appendChild(li);});}
+        if(rejected.length){arEl.style.display='block';rejected.forEach(e=>{const li=document.createElement('li');li.textContent=e.site+' — '+e.position+(e.rackType?' ('+e.rackType+')':'');rlEl.appendChild(li);});}
+        if(middays.length){amEl.style.display='block';miEl.innerHTML='<strong>'+middays.length+' midday position'+(middays.length>1?'s':'')+'</strong><br>Included in Optics, excluded from Cabling.<ul>'+middays.map(e=>'<li>'+esc(e.site)+' — '+esc(e.position)+(e.rackType?' ('+esc(e.rackType)+')':'')+'</li>').join('')+'</ul>';}
+
+        const sg=grpSite(grabbed);
+        sg.forEach((g,gi)=>{
+            g.rows.forEach(e=>{
+                const tr=document.createElement('tr');
+                if(e.isLost)tr.classList.add('azg-rl');if(e.isRejected)tr.classList.add('azg-rr');if(e.isMidday)tr.classList.add('azg-rm');
+                const ns=e.notes.filter(n=>n!=='MIDDAY').map(n=>'<span class="azg-tag '+(n==='LOST RES'?'azg-tag-l':'azg-tag-j')+'">'+n+'</span>').join(' ');
+                const btn=document.createElement('button');btn.className='azg-mt'+(e.isMidday?' azg-im':'');btn.textContent=e.isMidday?'☀ Remove':'🌙 Add';btn.title=e.isMidday?'Remove from midday':'Mark as midday';btn.addEventListener('click',function(){toggleMD(e,this);});
+                const cells=['site','position','uplink','asset','rackType','landDate','brick'].map(k=>{const td=document.createElement('td');td.textContent=e[k];return td;});
+                const tdM=document.createElement('td');tdM.appendChild(btn);
+                const tdN=document.createElement('td');tdN.innerHTML=ns;
+                cells.forEach(td=>tr.appendChild(td));tr.appendChild(tdM);tr.appendChild(tdN);
+                tbody.appendChild(tr);
             });
-            grabbed=sortBySite(grabbed); lastGrabbedRows=grabbed;
-            displayResults(grabbed,lostRes,rejPos,middayRows,skipAz,skipRt);
-        }catch(err){setStatus('Error processing: '+err.message,'error');console.error('[6az] Process error:',err);}
-    }
-    function findColumns(headers){
-        const m={az:null,site:null,position:null,uplinkConfig:null,asset:null,rackType:null,landDate:null,brick:null,notes:null,metronomeLength:null};
-        headers.forEach(h=>{ const l=h.toLowerCase().trim();
-            if(l==='az'&&!m.az) m.az=h; else if(l==='site'&&!m.site) m.site=h;
-            else if(l==='position'&&!m.position) m.position=h; else if(l.includes('uplink')&&!m.uplinkConfig) m.uplinkConfig=h;
-            else if(l==='asset'&&!m.asset) m.asset=h; else if((l==='rack type'||l==='racktype')&&!m.rackType) m.rackType=h;
-            else if((l.includes('rack land')||l==='land date'||l.includes('scheduled land'))&&!m.landDate) m.landDate=h;
-            else if(l==='brick'&&!m.brick) m.brick=h; else if((l==='notes'||l==='note')&&!m.notes) m.notes=h;
-            else if((l==='metronome length'||l==='metronome_length'||l==='metro length'||l==='metronome')&&!m.metronomeLength) m.metronomeLength=h;
-        }); return m;
-    }
-    function formatDate(val){
-        if(!val) return '';
-        if(typeof val==='number'){ try{ const d=XLSX.SSF.parse_date_code(val); if(d) return String(d.m).padStart(2,'0')+'/'+String(d.d).padStart(2,'0')+'/'+d.y; }catch(e){return String(val);} }
-        return String(val).trim();
-    }
+            if(gi<sg.length-1){for(let s=0;s<SITE_GAP_ROWS;s++){const d=document.createElement('tr');d.classList.add('azg-sd');d.innerHTML='<td colspan="9"></td>';tbody.appendChild(d);}}
+        });
+        tcEl.style.display='block';
 
-    // === TSV BUILDERS ===
-    function buildRowTSV(e){
-        const d=DESTINATION_DEFAULTS;
-        return [e.site,e.position,e.uplinkConfig,e.asset,e.rackType,e.landDate,e.brick,
-            d.brickHandoffDate,d.dateWorkloadReceived,d.copper,d.copperSignature,d.fiber,d.fiberSignature,
-            e.metronome,d.mnSignature,d.optics,d.brickPatching,d.sitePOC,d.positionStatus].join('\t');
-    }
-    function buildEmptyRowTSV(){ return new Array(19).fill('').join('\t'); }
-    function buildOpticsRowTSV(e){ return [e.site,e.position,e.uplinkConfig,e.asset,e.brick,e.landDate].join('\t'); }
-    function buildEmptyOpticsRowTSV(){ return new Array(6).fill('').join('\t'); }
-
-    // v2.9.0: Cabling TSV — EXCLUDES midday (blue + green) rows
-    function buildGroupedTSV(rows, includeAlerts){
-        const t = (includeAlerts ? rows : rows.filter(r=>r.status==='ok'))
-            .filter(r => !r.midday); // always exclude midday from cabling
-        if(!t.length) return '';
-        const groups=groupBySite(t), parts=[];
-        groups.forEach((g,i)=>{ g.rows.forEach(r=>parts.push(buildRowTSV(r)));
-            if(i<groups.length-1) for(let j=0;j<SITE_GAP_ROWS;j++) parts.push(buildEmptyRowTSV()); });
-        return parts.join('\n');
-    }
-
-    // v2.9.0: Optics TSV — INCLUDES all rows (morning + midday blue + midday green)
-    function buildOpticsTSV(rows){
-        const clean=rows.filter(r=>r.status==='ok'); if(!clean.length) return '';
-        const groups=groupBySite(clean), parts=[];
-        groups.forEach((g,i)=>{ g.rows.forEach(r=>parts.push(buildOpticsRowTSV(r)));
-            if(i<groups.length-1) parts.push(buildEmptyOpticsRowTSV()); });
-        return parts.join('\n');
+        const mo=grabbed.filter(e=>!e.isMidday).length,cl=grabbed.filter(e=>!e.isLost&&!e.isRejected).length;
+        statsEl.textContent=AZ_MAP[selectedAZ].label+': '+grabbed.length+' total | '+mo+' morning (cabling) | '+middays.length+' midday (optics only) | '+sg.length+' sites | '+lost.length+' lost | '+rejected.length+' rejected | '+skip+' skipped';
+        statsEl.style.display='block';
+        setSt('✓ Found '+grabbed.length+' positions across '+sg.length+' sites.','success');
+        obEl.textContent='19-col TSV (A-S) — Cabling excludes midday, Optics includes all.';obEl.style.display='block';
+        if(mo>0)crEl.style.display='flex';if(cl>0)ocrEl.style.display='flex';
     }
 
     // === CLIPBOARD ===
-    async function writeToClipboard(text){
-        if(navigator.clipboard&&navigator.clipboard.writeText){ try{await navigator.clipboard.writeText(text);return true;}catch(e){} }
-        try{ const ta=document.createElement('textarea'); ta.style.cssText='position:fixed;left:-9999px;top:-9999px;opacity:0;'; ta.value=text;
-            document.body.appendChild(ta); ta.select(); const ok=document.execCommand('copy'); document.body.removeChild(ta); if(ok) return true; }catch(e){}
-        try{ GM_setClipboard(text,'text'); return true; }catch(e){ return false; }
+    async function writeClip(text){if(typeof GM_setClipboard!=='undefined'){try{GM_setClipboard(text,'text');return true;}catch(e){}}try{await navigator.clipboard.writeText(text);return true;}catch(e){}try{const ta=document.createElement('textarea');ta.value=text;ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);return true;}catch(e){return false;}}
+
+    async function copyCabling(grabbed,alerts){
+        const cab=grabbed.filter(e=>!e.isMidday),gs=grpSite(cab),lines=[];
+        gs.forEach((g,gi)=>{g.rows.forEach(e=>{const ap=alerts?(e.isLost?'⚠ LOST RES | ':e.isRejected?'🚫 REJECTED | ':''):'';lines.push([e.site,e.position,e.uplink,e.asset,e.rackType,e.landDate,e.brick,DEST.brickHandoffDate,DEST.dateWorkloadReceived,e.measuredBy||'',DEST.copper,DEST.copperSig,DEST.fiber,DEST.fiberSig,'',DEST.mnSig,DEST.optics,DEST.brickPatching,ap+DEST.posStatus].join('\t'));});if(gi<gs.length-1){for(let s=0;s<SITE_GAP_ROWS;s++)lines.push('\t'.repeat(18));}});
+        return writeClip(lines.join('\n'));
     }
-    async function copyToClipboard(rows, includeAlerts){
-        const tsv=buildGroupedTSV(rows,includeAlerts);
-        if(!tsv){copyStatus.textContent='No cabling rows to copy (all may be midday).';setTimeout(()=>{copyStatus.textContent='';},3000);return false;}
-        return writeToClipboard(tsv);
-    }
-
-    // === DISPLAY RESULTS ===
-    function displayResults(grabbed, lostRes, rejPos, middayRows, skipAz, skipRt){
-        const morningCount=grabbed.filter(r=>r.status==='ok'&&!r.midday).length;
-        const middayCount=middayRows.length;
-        const blueCount=middayRows.filter(r=>r.middayColor==='blue').length;
-        const greenCount=middayRows.filter(r=>r.middayColor==='green').length;
-        const cleanCount=grabbed.filter(r=>r.status==='ok').length;
-        const siteGroups=groupBySite(grabbed);
-
-        statsEl.style.display='block';
-        let middayLabel = middayCount+' midday';
-        if (blueCount>0 && greenCount>0) middayLabel += ' ('+blueCount+' blue, '+greenCount+' green)';
-        else if (blueCount>0) middayLabel += ' (blue)';
-        else if (greenCount>0) middayLabel += ' (green)';
-        statsEl.textContent=morningCount+' cabling + '+middayLabel+' optics-only | '+siteGroups.length+' sites | '+lostRes.length+' lost res | '+rejPos.length+' rejected | '+skipRt+' non-EC2/Bonsai/EBS skipped | '+skipAz+' non-6az skipped';
-
-        // Midday banner
-        if(middayCount>0){
-            alertMiddayEl.style.display='block';
-            const siteList = [...new Set(middayRows.map(r=>r.site))].join(', ');
-            const colorDesc = [];
-            if (blueCount>0) colorDesc.push(blueCount+' blue');
-            if (greenCount>0) colorDesc.push(greenCount+' green');
-            middayInfoEl.textContent=middayCount+' midday position'+(middayCount>1?'s':'')+' ('+colorDesc.join(' + ')+') detected across: '+siteList+'. Included in Optics copy, excluded from Cabling copy.';
-        }
-
-        if(lostRes.length>0){ alertLostEl.style.display='block'; lostListEl.innerHTML='';
-            lostRes.forEach(r=>{ const li=document.createElement('li'); li.textContent=r.site+' — '+r.position+' ('+r.rackType+', Asset: '+r.asset+', Brick: '+r.brick+')'; lostListEl.appendChild(li); }); }
-        if(rejPos.length>0){ alertRejectedEl.style.display='block'; rejectedListEl.innerHTML='';
-            rejPos.forEach(r=>{ const li=document.createElement('li'); li.textContent=r.site+' — '+r.position+' ('+r.rackType+', Asset: '+r.asset+') — '+r.notes; rejectedListEl.appendChild(li); }); }
-        if(!grabbed.length){setStatus('No matching 6az EC2/Bonsai/EBS positions found.','info');return;}
-
-        setStatus(grabbed.length+' total across '+siteGroups.length+' sites. '+
-            (middayCount>0?'🟢🔵 '+middayCount+' midday (optics only). ':'')+
-            (lostRes.length>0?'⚠️ '+lostRes.length+' need re-reservation! ':'')+
-            (rejPos.length>0?'🚫 '+rejPos.length+' rejected. ':''),
-            lostRes.length>0||rejPos.length>0?'error':'success');
-
-        resultsBody.innerHTML='';
-        siteGroups.forEach((group,gIdx)=>{
-            group.rows.forEach(r=>{
-                const tr=document.createElement('tr');
-                if(r.status==='lost') tr.className='az6-row-lost';
-                else if(r.status==='rejected') tr.className='az6-row-rejected';
-                else if(r.midday) tr.className='az6-row-midday-'+(r.middayColor||'blue');
-                let middayTag = '';
-                if (r.midday) {
-                    const colorClass = r.middayColor==='green' ? 'az6-tag-midday-green' : 'az6-tag-midday-blue';
-                    const label = r.middayColor==='green' ? 'MIDDAY 🟢' : 'MIDDAY 🔵';
-                    middayTag = ' <span class="az6-tag-midday '+colorClass+'">'+label+'</span>';
-                }
-                tr.innerHTML='<td>'+esc(r.site)+middayTag+'</td><td>'+esc(r.position)+'</td><td>'+esc(r.uplinkConfig)+'</td><td>'+esc(r.asset)+'</td><td>'+esc(r.rackType)+'</td><td>'+esc(r.landDate)+'</td><td>'+esc(r.brick)+'</td><td>'+esc(r.notes)+'</td>';
-                resultsBody.appendChild(tr);
-            });
-            if(gIdx<siteGroups.length-1){ const d=document.createElement('tr'); d.className='az6-site-divider'; d.innerHTML='<td colspan="8"></td>'; resultsBody.appendChild(d); }
-        });
-        tableContainer.style.display='block';
-
-        const pLines=[], pGroups=siteGroups.slice(0,2);
-        pGroups.forEach((g,i)=>{ g.rows.slice(0,2).forEach(r=>{
-            const tag = r.midday ? ' [MIDDAY-'+(r.middayColor||'blue').toUpperCase()+']' : '';
-            pLines.push(buildRowTSV(r) + tag);
-        });
-            if(g.rows.length>2) pLines.push('  ... +'+(g.rows.length-2)+' more from '+g.site);
-            if(i<pGroups.length-1){pLines.push('');pLines.push('  ── 2-row gap ──');pLines.push('');} });
-        if(siteGroups.length>2) pLines.push('\n... +'+(siteGroups.length-2)+' more site groups');
-        outputBox.textContent='19-col TSV (A-S) — Cabling excludes midday, Optics includes all:\n\n'+pLines.join('\n');
-        outputBox.style.display='block';
-
-        if(morningCount>0) copyRow.style.display='flex';
-        if(cleanCount>0) opticsCopyRow.style.display='flex';
+    function buildOptics(grabbed){
+        const cl=grabbed.filter(e=>!e.isLost&&!e.isRejected);if(!cl.length)return'';
+        const gs=grpSite(cl),lines=[];
+        gs.forEach((g,gi)=>{g.rows.forEach(e=>{lines.push([e.site,e.position,e.uplink,e.asset,e.brick,e.landDate].join('\t'));});if(gi<gs.length-1)lines.push('');});
+        return lines.join('\n');
     }
 
-    // === EVENT HANDLERS ===
-    fab.addEventListener('click',()=>{ if(overlay.classList.contains('az6-visible')) overlay.classList.remove('az6-visible'); else autoGrab(); });
-    closeBtn.addEventListener('click',()=>overlay.classList.remove('az6-visible'));
-    overlay.addEventListener('click',e=>{ if(e.target===overlay) overlay.classList.remove('az6-visible'); });
-    document.addEventListener('keydown',e=>{ if(e.key==='Escape'&&overlay.classList.contains('az6-visible')) overlay.classList.remove('az6-visible'); });
+    // === AUTO-GRAB ===
+    async function autoGrab(){
+        overlay.classList.add('azg-visible');fab.classList.add('azg-loading');setSt('Detecting Excel file...','info');
+        shSel.innerHTML='<option value="">-- Select Sheet --</option>';shSel.disabled=true;grabBtn.disabled=true;
+        fileInfo.style.display='none';tbody.innerHTML='';tcEl.style.display='none';obEl.style.display='none';crEl.style.display='none';ocrEl.style.display='none';alEl.style.display='none';arEl.style.display='none';amEl.style.display='none';statsEl.style.display='none';lastRows=[];
+        const fi=detectFile();
+        if(!fi){fab.classList.remove('azg-loading');setSt('No Excel file detected. Navigate to a SharePoint Excel file first.','error');return;}
+        fnameEl.textContent=fi.fileName||'Unknown file';fsrcEl.textContent=fi.type+' — '+(fi.url||'').substring(0,90);fileInfo.style.display='flex';
+        try{const buf=await fetchXls(fi);workbook=XLSX.read(new Uint8Array(buf),{type:'array',cellStyles:true,cellDates:true,raw:false,dense:false});console.log('[azg] Sheets:',workbook.SheetNames);workbook.SheetNames.forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;shSel.appendChild(o);});shSel.disabled=false;grabBtn.disabled=false;setSt('Workbook loaded — '+workbook.SheetNames.length+' sheet(s). Select a sheet and click Grab Positions.','success');}catch(e){console.error('[azg]',e);setSt('Error: '+e.message,'error');}finally{fab.classList.remove('azg-loading');}
+    }
+
+    // === EVENTS ===
+    azSel.addEventListener('change',()=>{selectedAZ=azSel.value;fab.textContent=AZ_MAP[selectedAZ]?.label||'AZ';});
+    fab.addEventListener('click',()=>{if(overlay.classList.contains('azg-visible'))overlay.classList.remove('azg-visible');else autoGrab();});
+    closeBtn.addEventListener('click',()=>overlay.classList.remove('azg-visible'));
+    overlay.addEventListener('click',e=>{if(e.target===overlay)overlay.classList.remove('azg-visible');});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape'&&overlay.classList.contains('azg-visible'))overlay.classList.remove('azg-visible');});
     refreshBtn.addEventListener('click',()=>autoGrab());
     grabBtn.addEventListener('click',processSheet);
-
-    copyBtn.addEventListener('click',async()=>{
-        if(!lastGrabbedRows.length) return; copyStatus.textContent='Copying...';
-        const ok=await copyToClipboard(lastGrabbedRows,false);
-        copyStatus.textContent=ok?'✓ Copied cabling (no midday)! Grouped by site with 2-row gaps. Paste into Col A.':'⚠ Copy may have failed — try Ctrl+V anyway.';
-        setTimeout(()=>{copyStatus.textContent='';},4000);
-    });
-    copyAllBtn.addEventListener('click',async()=>{
-        if(!lastGrabbedRows.length) return; copyStatus.textContent='Copying...';
-        const ok=await copyToClipboard(lastGrabbedRows,true);
-        copyStatus.textContent=ok?'✓ Copied cabling with alerts (no midday) — grouped, 2-row gaps. Paste into Col A.':'⚠ Copy may have failed — try Ctrl+V anyway.';
-        setTimeout(()=>{copyStatus.textContent='';},4000);
-    });
-    copyOpticsBtn.addEventListener('click',async()=>{
-        if(!lastGrabbedRows.length) return; opticsCopyStatus.textContent='Copying...';
-        const tsv=buildOpticsTSV(lastGrabbedRows);
-        if(!tsv){opticsCopyStatus.textContent='No clean rows to copy.';setTimeout(()=>{opticsCopyStatus.textContent='';},3000);return;}
-        const ok=await writeToClipboard(tsv);
-        opticsCopyStatus.textContent=ok?'✓ Optics copied (morning + midday)! Paste into Col A of the optics workload.':'⚠ Copy may have failed — try Ctrl+V anyway.';
-        setTimeout(()=>{opticsCopyStatus.textContent='';},4000);
-    });
-
+    copyBtn.addEventListener('click',async()=>{if(!lastRows.length)return;csEl.textContent='Copying...';const ok=await copyCabling(lastRows,false);csEl.textContent=ok?'✓ Copied cabling! Paste into Col A.':'⚠ Copy may have failed.';setTimeout(()=>{csEl.textContent='';},4000);});
+    copyaBtn.addEventListener('click',async()=>{if(!lastRows.length)return;csEl.textContent='Copying...';const ok=await copyCabling(lastRows,true);csEl.textContent=ok?'✓ Copied cabling with alerts! Paste into Col A.':'⚠ Copy may have failed.';setTimeout(()=>{csEl.textContent='';},4000);});
+    copyoBtn.addEventListener('click',async()=>{if(!lastRows.length)return;osEl.textContent='Copying...';const tsv=buildOptics(lastRows);if(!tsv){osEl.textContent='No clean rows.';setTimeout(()=>{osEl.textContent='';},3000);return;}const ok=await writeClip(tsv);osEl.textContent=ok?'✓ Optics copied! Paste into Col A.':'⚠ Copy may have failed.';setTimeout(()=>{osEl.textContent='';},4000);});
 })();
 
