@@ -3,8 +3,8 @@
 // @name         AZGrab
 // @namespace    https://amazon.sharepoint.com/
 // @version      4.1.1
-// @updateURL    https://raw.githubusercontent.com/morakbri/WorkloadTool/AZGrab/azgrab.user.js
-// @downloadURL  https://raw.githubusercontent.com/morakbri/WorkloadTool/AZGrab/azgrab.user.js
+// @updateURL    https://raw.githubusercontent.com/morakbri/WorkloadTool//main/azgrab.user.js
+// @downloadURL  https://raw.githubusercontent.com/morakbri/WorkloadTool//main/azgrab.user.js
 // @description  Auto-extracts rack positions from SharePoint Excel files — supports 1/62AZ, 6AZ, 7/55AZ, 12AZ with AZ selector. Groups by site with 2-row gaps. Midday rows (above thick border separator) included in optics only, excluded from cabling. Per-row midday override.
 // @author       @morakbri @tngujona
 // @match        https://*.sharepoint.com/*
